@@ -7,7 +7,10 @@ Order fetch and push flows
 import json
 import sys
 from typing import Any, Dict, List
-from clients import pb_login, pb_logout, pb_call, _ensure_parsed
+from clients import (
+    pb_login, pb_logout, pb_call, _ensure_parsed,
+    shop, SHOPIFY_REST
+)
 import argparse
 import logging
 from datetime import datetime
@@ -73,7 +76,8 @@ def fetch_orders(filter_params: Dict[str, Any] | None = None) -> List[Dict[str, 
     logger.info(f"Fetching orders with filter: {filter_params}")
     client, token = pb_login()
     try:
-        raw = pb_call(client, token, "dropshipping.getOrders", [filter_params or {}])
+        json_payload = json.dumps(filter_params or {})
+        raw = pb_call(client, token, "dropshipping.getOrders", [json_payload])
         parsed = _ensure_parsed(raw)
         logger.info(f"Parsed {len(parsed)} orders")
         return [normalize_order(o) for o in parsed]
@@ -84,12 +88,149 @@ def fetch_refund_orders(filter_params: Dict[str, Any] | None = None) -> List[Dic
     logger.info(f"Fetching refund orders with filter: {filter_params}")
     client, token = pb_login()
     try:
-        raw = pb_call(client, token, "dropshipping.getRefundOrders", [filter_params or {}])
+        json_payload = json.dumps(filter_params or {})
+        raw = pb_call(client, token, "dropshipping.getRefundOrders", [json_payload])
         parsed = _ensure_parsed(raw)
         logger.info(f"Parsed {len(parsed)} refund orders")
         return [normalize_refund(r) for r in parsed]
     finally:
         pb_logout(client, token)
+
+
+# New: fetch product list
+# ---------------------------------------------------------------------------#
+# Shopify helpers
+
+def fetch_product_list() -> List[Dict[str, Any]]:
+    """
+    Fetch the full product list from PowerBody Dropshipping.
+    Wrapper around the `dropshipping.getProductList` endpoint.
+    """
+    logger.info("Fetching product list from PowerBody API")
+    client, token = pb_login()
+    try:
+        raw = pb_call(client, token, "dropshipping.getProductList")
+        parsed = _ensure_parsed(raw)
+        logger.info(f"Fetched {len(parsed)} products")
+        return parsed
+    finally:
+        pb_logout(client, token)
+
+
+def fetch_shopify_orders(created_at_min: str | None = None,
+                         created_at_max: str | None = None,
+                         status: str = "any") -> List[Dict[str, Any]]:
+    """
+    Pull orders from Shopify REST.
+    * `status` can be 'open', 'closed', 'cancelled', or 'any'.
+    * Date strings are YYYY‑MM‑DD (UTC). If omitted, fetches all.
+    Returns the raw Shopify order JSON objects.
+    """
+    logger.info(f"Fetching Shopify orders status={status} "
+                f"from={created_at_min} to={created_at_max}")
+    params = {"status": status, "limit": 250, "order": "created_at asc"}
+    if created_at_min:
+        params["created_at_min"] = f"{created_at_min}T00:00:00Z"
+    if created_at_max:
+        params["created_at_max"] = f"{created_at_max}T23:59:59Z"
+    out: List[Dict[str, Any]] = []
+    page_info = None
+    while True:
+        # pagination cursor
+        if page_info:
+            params["page_info"] = page_info
+        r = shop.get(f"{SHOPIFY_REST}/orders.json", params=params, timeout=30)
+        r.raise_for_status()
+        batch = r.json().get("orders", [])
+        out.extend(batch)
+        link = r.headers.get("Link", "")
+        if 'rel="next"' not in link:
+            break
+        page_info = link.split("page_info=")[1].split(">")[0]
+    logger.info(f"Fetched {len(out)} Shopify orders")
+    return out
+
+def export_csv(records: List[Dict[str, Any]], fname: str) -> str:
+    """
+    Simple CSV export util; writes the list of dictionaries to *fname*.
+    Returns the file name.
+    """
+    import csv
+    logger.info(f"Exporting {len(records)} rows to CSV '{fname}'")
+    if not records:
+        logger.warning("No records – CSV will contain only headers")
+        hdr = []
+    else:
+        hdr = records[0].keys()
+    with open(fname, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=hdr)
+        w.writeheader()
+        w.writerows(records)
+    return fname
+
+def shopify_order_to_powerbody(o: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a Shopify order JSON into a payload accepted by dropshipping.createOrder.
+    """
+    def map_address(addr: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "name": addr.get("first_name", ""),
+            "surname": addr.get("last_name", ""),
+            "address1": addr.get("address1") or "",
+            "address2": addr.get("address2") or "",
+            "address3": "",
+            "postcode": addr.get("zip") or "",
+            "city": addr.get("city") or "",
+            "county": addr.get("province") or "",
+            "country_name": addr.get("country") or "",
+            "country_code": addr.get("country_code") or "",
+            "phone": addr.get("phone") or "",
+            "email": o.get("email") or "",
+        }
+    line_items = []
+    for li in o.get("line_items", []):
+        line_items.append({
+            # product_id is optional – leave blank
+            "sku": li.get("sku") or "",
+            "name": li.get("name") or "",
+            "qty": int(li.get("quantity", 0)),
+            "price": float(li.get("price", 0)),
+            "currency": o.get("currency") or "EUR",
+            "tax": float(sum(t["rate"] for t in li.get("tax_lines", []))) * 100
+                    if li.get("tax_lines") else 0.0,
+        })
+    shipping_lines = o.get("shipping_lines", [])
+    shipping_price = float(shipping_lines[0]["price"]) if shipping_lines else 0.0
+    transport_code = shipping_lines[0].get("title") if shipping_lines else ""
+    total_weight = float(o.get("total_weight", 0)) / 1000.0  # g → kg
+    return {
+        "id": o.get("name") or str(o.get("id")),   # use Shopify order name (#1003)
+        "status": "on hold",
+        "currency_rate": 1,
+        "transport_code": transport_code,
+        "weight": total_weight,
+        "date_add": o.get("created_at", "")[:10],
+        "comment": o.get("note") or "",
+        "shipping_price": shipping_price,
+        "address": map_address(o.get("shipping_address") or o.get("billing_address") or {}),
+        "products": line_items,
+    }
+
+def sync_shopify_to_powerbody(created_at_min: str | None = None,
+                              created_at_max: str | None = None) -> None:
+    """
+    Fetch Shopify orders (open/unfulfilled) and push them to PowerBody.
+    """
+    orders = fetch_shopify_orders(created_at_min, created_at_max, status="open")
+    logger.info(f"Syncing {len(orders)} Shopify orders to PowerBody")
+    for so in orders:
+        pb_payload = shopify_order_to_powerbody(so)
+        resp = create_order(pb_payload)
+        status = resp.get("api_response")
+        if status == "ALREADY_EXISTS":
+            resp = update_order(pb_payload)
+            status = resp.get("api_response")
+        logger.info(f"Shopify order {so.get('name')} → PowerBody {status}")
 # Comment helpers
 def insert_comment(order_id: int, author_name: str, comment: str) -> Dict[str, Any]:
     payload = {
@@ -97,7 +238,7 @@ def insert_comment(order_id: int, author_name: str, comment: str) -> Dict[str, A
         "comments": [
             {
                 "author_name": author_name,
-                "comment": comment,
+                "comments": comment,
                 "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             }
         ],
@@ -123,7 +264,7 @@ def create_order(order: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Creating order {order.get('order_id')}")
     client, token = pb_login()
     try:
-        resp = pb_call(client, token, "dropshipping.createOrder", [order]) or {}
+        resp = pb_call(client, token, "dropshipping.createOrder", [json.dumps(order)]) or {}
         return {**order, "api_response": resp.get("api_response", "FAIL")}
     finally:
         pb_logout(client, token)
@@ -132,7 +273,7 @@ def update_order(order: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Updating order {order.get('order_id')}")
     client, token = pb_login()
     try:
-        resp = pb_call(client, token, "dropshipping.updateOrder", [order]) or {}
+        resp = pb_call(client, token, "dropshipping.updateOrder", [json.dumps(order)]) or {}
         return {**order, "api_response": resp.get("api_response", "FAIL")}
     finally:
         pb_logout(client, token)
@@ -155,6 +296,18 @@ def main() -> None:
     refund_parser = subparsers.add_parser("refunds-export", help="Export refund orders")
     refund_parser.add_argument("--from", dest="from_date", help="Start date (YYYY-MM-DD)")
     refund_parser.add_argument("--to", dest="to_date", help="End date (YYYY-MM-DD)")
+
+    product_parser = subparsers.add_parser("products", help="Export product list")
+
+    shop_exp_parser = subparsers.add_parser("shopify-export", help="Export orders from Shopify")
+    shop_exp_parser.add_argument("--from", dest="from_date", help="Start date (YYYY‑MM‑DD)")
+    shop_exp_parser.add_argument("--to", dest="to_date", help="End date (YYYY‑MM‑DD)")
+    shop_exp_parser.add_argument("--csv", dest="csv_path", help="Write output to CSV instead of JSON")
+
+    shop_sync_parser = subparsers.add_parser("shopify-sync",
+                                             help="Fetch Shopify orders and push to PowerBody")
+    shop_sync_parser.add_argument("--from", dest="from_date", help="Start date (YYYY‑MM‑DD)")
+    shop_sync_parser.add_argument("--to", dest="to_date", help="End date (YYYY‑MM‑DD)")
 
     comment_parser = subparsers.add_parser("comments", help="Fetch last 7‑days comments")
 
@@ -191,6 +344,20 @@ def main() -> None:
         refunds = fetch_refund_orders(filt or None)
         logger.info(f"Exporting {len(refunds)} refunds to stdout")
         print(json.dumps(refunds, indent=2))
+    elif args.command == "products":
+        products = fetch_product_list()
+        logger.info(f"Exporting {len(products)} products to stdout")
+        print(json.dumps(products, indent=2))
+    elif args.command == "shopify-export":
+        sorders = fetch_shopify_orders(args.from_date, args.to_date)
+        logger.info(f"Fetched {len(sorders)} Shopify orders")
+        if args.csv_path:
+            export_csv(sorders, args.csv_path)
+            print(f"✅ CSV written to {args.csv_path}")
+        else:
+            print(json.dumps(sorders, indent=2))
+    elif args.command == "shopify-sync":
+        sync_shopify_to_powerbody(args.from_date, args.to_date)
     elif args.command == "comments":
         comments = get_comments()
         print(json.dumps(comments, indent=2))
